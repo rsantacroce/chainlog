@@ -1,6 +1,6 @@
 # chainlog
 
-[![CI](https://github.com/your-org/chainlog/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/chainlog/actions/workflows/ci.yml)
+[![CI](https://github.com/rsantacroce/chainlog/actions/workflows/ci.yml/badge.svg)](https://github.com/rsantacroce/chainlog/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
