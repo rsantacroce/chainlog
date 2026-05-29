@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{bounded, Sender};
 
@@ -18,13 +17,7 @@ use crate::entry::{AuditEntry, Payload, Receipt, Record, GENESIS_PREV_HASH};
 use crate::error::{Error, Result};
 use crate::hash;
 use crate::store::Store;
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::util::now_ms;
 
 enum Cmd {
     Write {

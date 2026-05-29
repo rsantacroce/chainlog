@@ -7,27 +7,33 @@
 //! history.
 //!
 //! ## Configuration (environment)
-//! - `CHAINLOG_ADDR`        bind address (default `127.0.0.1:8888`)
-//! - `CHAINLOG_DATA`        path to the JSONL log file (default `./chainlog.log`)
-//! - `CHAINLOG_KEY`         base64 master key, OR `CHAINLOG_KEY_FILE` path
-//! - `CHAINLOG_WRITE_TOKEN` bearer token required to append
-//! - `CHAINLOG_READ_TOKEN`  bearer token required to read / verify / decrypt
+//! - `CHAINLOG_ADDR`: bind address (default `127.0.0.1:8888`)
+//! - `CHAINLOG_DATA`: path to the JSONL log file, or segment dir (default `./chainlog.log`)
+//! - `CHAINLOG_SEGMENT_MAX_ENTRIES`: if set, treat `CHAINLOG_DATA` as a segment directory and rotate every N entries
+//! - `CHAINLOG_KEY`: base64 master key, OR `CHAINLOG_KEY_FILE` path
+//! - `CHAINLOG_KEYRING_DIR`: if set, use per-subject keys here (enables crypto-shred + `/v1/keys` endpoints) instead of a master key
+//! - `CHAINLOG_ADMIN_TOKEN`: bearer token required for key management
+//! - `CHAINLOG_WRITE_TOKEN`: bearer token required to append
+//! - `CHAINLOG_READ_TOKEN`: bearer token required to read / verify / decrypt
+//! - `CHAINLOG_SIGN_KEY`: optional base64 Ed25519 seed; enables `/v1/checkpoint`
 //!
 //! Roles are separated on purpose: a writer that can append does not need read
 //! access, modelling separation of duties.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path as AxPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chainlog_core::{
-    open, read_all, AuditLog, FileStore, LocalKeyProvider, Outcome, Record, verify_entries,
+    now_ms, open, read_all, read_all_segmented, verify_entries, AuditEntry, AuditLog,
+    CheckpointSigner, FileStore, KeyProvider, KeyringProvider, LocalKeyProvider, Outcome, Record,
+    SegmentedStore,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,10 +41,28 @@ use serde_json::{json, Value};
 #[derive(Clone)]
 struct AppState {
     log: AuditLog,
-    key: Arc<LocalKeyProvider>,
+    key: Arc<dyn KeyProvider>,
+    keyring: Option<Arc<KeyringProvider>>,
+    signer: Option<Arc<CheckpointSigner>>,
     data_path: PathBuf,
+    segmented: bool,
     write_token: String,
     read_token: String,
+    admin_token: String,
+}
+
+/// Read the full chain for reads/verify, tolerating a not-yet-created log.
+fn read_log(path: &Path, segmented: bool) -> Result<Vec<AuditEntry>, ApiError> {
+    let res = if segmented {
+        read_all_segmented(path)
+    } else {
+        read_all(path)
+    };
+    match res {
+        Ok(e) => Ok(e),
+        Err(chainlog_core::Error::Io(_)) => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// An error that maps onto an HTTP status + JSON body.
@@ -73,7 +97,10 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 fn require(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
     match bearer(headers) {
         Some(t) if !expected.is_empty() && t == expected => Ok(()),
-        _ => Err(ApiError(StatusCode::UNAUTHORIZED, "invalid or missing bearer token".into())),
+        _ => Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing bearer token".into(),
+        )),
     }
 }
 
@@ -146,12 +173,7 @@ async fn read_records(
 ) -> Result<impl IntoResponse, ApiError> {
     require(&headers, &st.read_token)?;
 
-    let entries = match read_all(&st.data_path) {
-        Ok(e) => e,
-        // An empty / not-yet-created log reads as no entries.
-        Err(chainlog_core::Error::Io(_)) => Vec::new(),
-        Err(e) => return Err(e.into()),
-    };
+    let entries = read_log(&st.data_path, st.segmented)?;
 
     let from = q.from.unwrap_or(0);
     let to = q.to.unwrap_or(u64::MAX);
@@ -173,16 +195,28 @@ async fn read_records(
     Ok(Json(json!({ "count": out.len(), "entries": out })))
 }
 
+async fn checkpoint(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require(&headers, &st.read_token)?;
+    let signer = st.signer.as_ref().ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "no signing key configured (set CHAINLOG_SIGN_KEY)".into(),
+        )
+    })?;
+    let (seq, head_hash) = st.log.head()?;
+    let cp = signer.sign(seq, &head_hash, now_ms());
+    Ok(Json(cp))
+}
+
 async fn verify(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require(&headers, &st.read_token)?;
-    let entries = match read_all(&st.data_path) {
-        Ok(e) => e,
-        Err(chainlog_core::Error::Io(_)) => Vec::new(),
-        Err(e) => return Err(e.into()),
-    };
+    let entries = read_log(&st.data_path, st.segmented)?;
     let report = verify_entries(&entries);
     let status = if report.is_valid() {
         StatusCode::OK
@@ -192,13 +226,56 @@ async fn verify(
     Ok((status, Json(report)))
 }
 
+fn require_keyring(st: &AppState) -> Result<&Arc<KeyringProvider>, ApiError> {
+    st.keyring.as_ref().ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "key management requires keyring mode (set CHAINLOG_KEYRING_DIR)".into(),
+        )
+    })
+}
+
+async fn create_key(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxPath(key_id): AxPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require(&headers, &st.admin_token)?;
+    let keyring = require_keyring(&st)?;
+    let created = keyring.ensure(&key_id)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "key_id": key_id, "created": created })),
+    ))
+}
+
+async fn shred_key(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxPath(key_id): AxPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require(&headers, &st.admin_token)?;
+    let keyring = require_keyring(&st)?;
+    let shredded = keyring.shred(&key_id)?;
+    Ok(Json(json!({ "key_id": key_id, "shredded": shredded })))
+}
+
+async fn list_keys(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require(&headers, &st.admin_token)?;
+    let keyring = require_keyring(&st)?;
+    Ok(Json(json!({ "key_ids": keyring.list()? })))
+}
+
 fn load_key() -> Result<LocalKeyProvider, String> {
     if let Ok(b64) = std::env::var("CHAINLOG_KEY") {
         return LocalKeyProvider::from_base64(&b64).map_err(|e| e.to_string());
     }
     if let Ok(path) = std::env::var("CHAINLOG_KEY_FILE") {
-        let contents = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reading {path}: {e}"))?;
+        let contents =
+            std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
         return LocalKeyProvider::from_base64(&contents).map_err(|e| e.to_string());
     }
     Err("set CHAINLOG_KEY (base64) or CHAINLOG_KEY_FILE".into())
@@ -226,27 +303,56 @@ async fn main() {
         );
     }
 
-    let key = match load_key() {
-        Ok(k) => Arc::new(k),
-        Err(e) => {
-            tracing::error!("key configuration error: {e}");
-            std::process::exit(1);
-        }
-    };
+    // Pick a key provider: a per-subject keyring (enables crypto-shred + key
+    // management endpoints) or a single master key.
+    let (key, keyring): (Arc<dyn KeyProvider>, Option<Arc<KeyringProvider>>) =
+        match std::env::var("CHAINLOG_KEYRING_DIR") {
+            Ok(dir) => match KeyringProvider::open(&dir, true) {
+                Ok(k) => {
+                    tracing::info!("keyring mode: per-subject keys in {dir}");
+                    let a = Arc::new(k);
+                    (a.clone(), Some(a))
+                }
+                Err(e) => {
+                    tracing::error!("opening keyring dir {dir}: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(_) => match load_key() {
+                Ok(k) => (Arc::new(k), None),
+                Err(e) => {
+                    tracing::error!("key configuration error: {e}");
+                    std::process::exit(1);
+                }
+            },
+        };
+    let admin_token = std::env::var("CHAINLOG_ADMIN_TOKEN").unwrap_or_default();
 
-    let store = match FileStore::open(&data_path) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("opening data file {}: {e}", data_path.display());
-            std::process::exit(1);
-        }
-    };
+    // If CHAINLOG_SEGMENT_MAX_ENTRIES is set, treat CHAINLOG_DATA as a segment
+    // directory and rotate; otherwise it's a single append-only file.
+    let segment_max = std::env::var("CHAINLOG_SEGMENT_MAX_ENTRIES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let segmented = segment_max.is_some();
 
-    let log = match AuditLog::builder()
-        .store(store)
-        .key_provider_arc(key.clone())
-        .build()
-    {
+    let builder = AuditLog::builder().key_provider_arc(key.clone());
+    let build_result = match segment_max {
+        Some(max) => match SegmentedStore::open(&data_path, max) {
+            Ok(s) => builder.store(s).build(),
+            Err(e) => {
+                tracing::error!("opening segment dir {}: {e}", data_path.display());
+                std::process::exit(1);
+            }
+        },
+        None => match FileStore::open(&data_path) {
+            Ok(s) => builder.store(s).build(),
+            Err(e) => {
+                tracing::error!("opening data file {}: {e}", data_path.display());
+                std::process::exit(1);
+            }
+        },
+    };
+    let log = match build_result {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("building audit log: {e}");
@@ -254,19 +360,43 @@ async fn main() {
         }
     };
 
+    let signer = match std::env::var("CHAINLOG_SIGN_KEY") {
+        Ok(b64) => match CheckpointSigner::from_base64(&b64) {
+            Ok(s) => {
+                tracing::info!("checkpoint signing enabled (pubkey {})", s.public_base64());
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                tracing::error!("invalid CHAINLOG_SIGN_KEY: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) => {
+            tracing::info!("checkpoint signing disabled (set CHAINLOG_SIGN_KEY to enable)");
+            None
+        }
+    };
+
     let state = AppState {
         log,
         key,
+        keyring,
+        signer,
         data_path,
+        segmented,
         write_token,
         read_token,
+        admin_token,
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/records", post(append).get(read_records))
         .route("/v1/head", get(head))
+        .route("/v1/checkpoint", get(checkpoint))
         .route("/v1/verify", get(verify))
+        .route("/v1/keys", get(list_keys))
+        .route("/v1/keys/:key_id", post(create_key).delete(shred_key))
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {

@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::entry::{AuditEntry, GENESIS_PREV_HASH};
 
+/// A trusted starting point for verifying a chain that no longer begins at
+/// genesis (e.g. after retention pruning). Typically taken from a signed
+/// checkpoint at the prune boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Anchor {
+    /// The seq of the last entry *before* the first entry being verified.
+    pub seq: u64,
+    /// That entry's `entry_hash` — the first verified entry must point at it.
+    pub hash: String,
+}
+
 /// A single detected problem with the chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Violation {
@@ -42,8 +53,20 @@ impl VerifyReport {
     }
 }
 
-/// Verify a chain given its entries in order.
+/// Verify a chain given its entries in order, starting from genesis.
 pub fn verify_entries<'a, I>(entries: I) -> VerifyReport
+where
+    I: IntoIterator<Item = &'a AuditEntry>,
+{
+    verify_entries_from(None, entries)
+}
+
+/// Verify a chain that may start after a trusted [`Anchor`] instead of genesis.
+///
+/// Pass `None` to require the chain to begin at genesis (`seq == 1`,
+/// `prev_hash == GENESIS`). Pass `Some(anchor)` — e.g. from a signed checkpoint
+/// at a prune boundary — to require the first entry to follow that anchor.
+pub fn verify_entries_from<'a, I>(anchor: Option<&Anchor>, entries: I) -> VerifyReport
 where
     I: IntoIterator<Item = &'a AuditEntry>,
 {
@@ -69,26 +92,51 @@ where
         }
 
         match prev {
-            None => {
-                // 2a. Genesis checks.
-                if entry.prev_hash != GENESIS_PREV_HASH {
-                    violations.push(Violation {
-                        seq: entry.seq,
-                        kind: ViolationKind::BadGenesis,
-                        detail: format!(
-                            "first entry prev_hash {} != genesis {}",
-                            entry.prev_hash, GENESIS_PREV_HASH
-                        ),
-                    });
+            None => match anchor {
+                // 2a-anchored: first entry must follow the trusted anchor.
+                Some(a) => {
+                    if entry.prev_hash != a.hash {
+                        violations.push(Violation {
+                            seq: entry.seq,
+                            kind: ViolationKind::BrokenLink,
+                            detail: format!(
+                                "first entry prev_hash {} != anchor hash {}",
+                                entry.prev_hash, a.hash
+                            ),
+                        });
+                    }
+                    if entry.seq != a.seq + 1 {
+                        violations.push(Violation {
+                            seq: entry.seq,
+                            kind: ViolationKind::SequenceGap,
+                            detail: format!(
+                                "first entry seq {} does not follow anchor seq {}",
+                                entry.seq, a.seq
+                            ),
+                        });
+                    }
                 }
-                if entry.seq != 1 {
-                    violations.push(Violation {
-                        seq: entry.seq,
-                        kind: ViolationKind::SequenceGap,
-                        detail: format!("first entry seq is {}, expected 1", entry.seq),
-                    });
+                // 2a-genesis: classic genesis checks.
+                None => {
+                    if entry.prev_hash != GENESIS_PREV_HASH {
+                        violations.push(Violation {
+                            seq: entry.seq,
+                            kind: ViolationKind::BadGenesis,
+                            detail: format!(
+                                "first entry prev_hash {} != genesis {}",
+                                entry.prev_hash, GENESIS_PREV_HASH
+                            ),
+                        });
+                    }
+                    if entry.seq != 1 {
+                        violations.push(Violation {
+                            seq: entry.seq,
+                            kind: ViolationKind::SequenceGap,
+                            detail: format!("first entry seq is {}, expected 1", entry.seq),
+                        });
+                    }
                 }
-            }
+            },
             Some(p) => {
                 // 2b. Linkage: this entry must point at the previous hash.
                 if entry.prev_hash != p.entry_hash {
@@ -106,10 +154,7 @@ where
                     violations.push(Violation {
                         seq: entry.seq,
                         kind: ViolationKind::SequenceGap,
-                        detail: format!(
-                            "seq {} does not follow previous seq {}",
-                            entry.seq, p.seq
-                        ),
+                        detail: format!("seq {} does not follow previous seq {}", entry.seq, p.seq),
                     });
                 }
             }

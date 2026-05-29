@@ -35,10 +35,7 @@ impl FileStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let tail = Self::read_tail(path)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(FileStore { file, tail })
     }
 
@@ -89,10 +86,7 @@ impl MemoryStore {
 
 impl Store for MemoryStore {
     fn tail(&self) -> Result<Option<(u64, String)>> {
-        Ok(self
-            .entries
-            .last()
-            .map(|e| (e.seq, e.entry_hash.clone())))
+        Ok(self.entries.last().map(|e| (e.seq, e.entry_hash.clone())))
     }
 
     fn append(&mut self, entry: &AuditEntry) -> Result<()> {

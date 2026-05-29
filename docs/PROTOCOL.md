@@ -10,10 +10,11 @@ All request/response bodies are JSON (`Content-Type: application/json`).
 
 Bearer tokens, split by role (separation of duties):
 
-| Role  | Header                              | Grants                          |
-|-------|-------------------------------------|---------------------------------|
-| Write | `Authorization: Bearer <WRITE>`     | append entries                  |
-| Read  | `Authorization: Bearer <READ>`      | read, head, verify, decrypt PII |
+| Role  | Header                              | Grants                                |
+|-------|-------------------------------------|---------------------------------------|
+| Write | `Authorization: Bearer <WRITE>`     | append entries                        |
+| Read  | `Authorization: Bearer <READ>`      | read, head, verify, checkpoint, decrypt |
+| Admin | `Authorization: Bearer <ADMIN>`     | key management (`/v1/keys`)           |
 
 A missing/incorrect token returns `401`. If a token env var is empty, every
 request for that role is rejected.
@@ -144,6 +145,65 @@ A violation looks like:
 ```
 
 `kind` is one of: `bad_hash`, `broken_link`, `sequence_gap`, `bad_genesis`.
+
+---
+
+## `GET /v1/checkpoint`  *(read token)*
+
+Return a fresh Ed25519-signed checkpoint of the current head. Requires the server
+to be started with `CHAINLOG_SIGN_KEY`; otherwise returns `501 Not Implemented`.
+
+```json
+200 OK
+{
+  "seq": 4,
+  "head_hash": "6487b734…",
+  "timestamp": 1780000000000,
+  "public_key": "jiEqRs/r…",   // base64 Ed25519 public key
+  "signature": "mw3poBaf…"     // base64 Ed25519 signature
+}
+```
+
+Keep checkpoints to pin history and to anchor retention-pruned logs (verify the
+remaining tail against the checkpoint at the prune boundary).
+
+---
+
+## Key management *(admin token)*
+
+Only available when the server runs in keyring mode (`CHAINLOG_KEYRING_DIR`).
+Otherwise these return `501 Not Implemented`.
+
+### `POST /v1/keys/{key_id}`
+
+Create a per-subject key (idempotent).
+
+```json
+201 Created
+{ "key_id": "subject-123", "created": true }
+```
+
+Writing a record with a new `key_id` also mints its key automatically; this
+endpoint is for pre-provisioning.
+
+### `DELETE /v1/keys/{key_id}`
+
+**Crypto-shred** a subject's key. All PII sealed under it becomes permanently
+undecryptable; the chain stays intact and continues to verify.
+
+```json
+200 OK
+{ "key_id": "subject-123", "shredded": true }
+```
+
+### `GET /v1/keys`
+
+List the `key_id`s currently held.
+
+```json
+200 OK
+{ "key_ids": ["subject-123", "subject-456"] }
+```
 
 ---
 

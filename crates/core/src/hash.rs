@@ -8,11 +8,7 @@
 //! the bytes are reproducible across runs and machines.
 
 use crate::entry::AuditEntry;
-
-fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-    buf.extend_from_slice(bytes);
-}
+use crate::util::push_field;
 
 /// Build the canonical byte string that the entry hash is computed over.
 /// Note: this deliberately excludes `entry_hash` itself.
@@ -23,7 +19,10 @@ fn canonical_bytes(e: &AuditEntry) -> Vec<u8> {
     push_field(&mut buf, e.event_type.as_bytes());
     push_field(&mut buf, e.outcome.as_str().as_bytes());
     push_field(&mut buf, e.actor.as_bytes());
-    push_field(&mut buf, e.instruction_id.as_deref().unwrap_or("").as_bytes());
+    push_field(
+        &mut buf,
+        e.instruction_id.as_deref().unwrap_or("").as_bytes(),
+    );
     // Payload is serialized canonically; covers ciphertext, not plaintext PII.
     let payload = serde_json::to_vec(&e.payload).expect("payload is always serializable");
     push_field(&mut buf, &payload);

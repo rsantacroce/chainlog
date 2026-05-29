@@ -23,12 +23,41 @@ use chacha20poly1305::{
 use crate::entry::EncryptedPii;
 use crate::error::{Error, Result};
 
-const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 
-fn random_bytes(out: &mut [u8]) -> Result<()> {
+pub(crate) const MASTER_KEY_LEN: usize = KEY_LEN;
+
+pub(crate) fn random_bytes(out: &mut [u8]) -> Result<()> {
     getrandom::getrandom(out).map_err(|e| Error::Crypto(format!("rng failure: {e}")))
+}
+
+/// Wrap (encrypt) `dek` under a raw 256-bit key, returning `nonce ‖ ciphertext`.
+pub(crate) fn wrap_with_key(key: &[u8; KEY_LEN], dek: &[u8]) -> Result<Vec<u8>> {
+    let mut nonce = [0u8; NONCE_LEN];
+    random_bytes(&mut nonce)?;
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let ct = cipher
+        .encrypt(XNonce::from_slice(&nonce), dek)
+        .map_err(|e| Error::Crypto(format!("wrap dek: {e}")))?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Unwrap (decrypt) a `nonce ‖ ciphertext` blob under a raw 256-bit key.
+pub(crate) fn unwrap_with_key(key: &[u8; KEY_LEN], wrapped: &[u8]) -> Result<Vec<u8>> {
+    if wrapped.len() < NONCE_LEN {
+        return Err(Error::Crypto("wrapped dek too short".into()));
+    }
+    let (nonce, ct) = wrapped.split_at(NONCE_LEN);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .decrypt(XNonce::from_slice(nonce), ct)
+        .map_err(|e| Error::Crypto(format!("unwrap dek (wrong key or tampered?): {e}")))
 }
 
 /// Abstraction over "something that can wrap and unwrap data keys".
@@ -82,35 +111,15 @@ impl LocalKeyProvider {
     pub fn to_base64(&self) -> String {
         B64.encode(self.master)
     }
-
-    fn cipher(&self) -> XChaCha20Poly1305 {
-        XChaCha20Poly1305::new((&self.master).into())
-    }
 }
 
 impl KeyProvider for LocalKeyProvider {
     fn wrap_dek(&self, _key_id: &str, dek: &[u8]) -> Result<Vec<u8>> {
-        let mut nonce = [0u8; NONCE_LEN];
-        random_bytes(&mut nonce)?;
-        let ct = self
-            .cipher()
-            .encrypt(XNonce::from_slice(&nonce), dek)
-            .map_err(|e| Error::Crypto(format!("wrap dek: {e}")))?;
-        // Persist as nonce || ciphertext.
-        let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
-        Ok(out)
+        wrap_with_key(&self.master, dek)
     }
 
     fn unwrap_dek(&self, _key_id: &str, wrapped: &[u8]) -> Result<Vec<u8>> {
-        if wrapped.len() < NONCE_LEN {
-            return Err(Error::Crypto("wrapped dek too short".into()));
-        }
-        let (nonce, ct) = wrapped.split_at(NONCE_LEN);
-        self.cipher()
-            .decrypt(XNonce::from_slice(nonce), ct)
-            .map_err(|e| Error::Crypto(format!("unwrap dek (wrong key or tampered?): {e}")))
+        unwrap_with_key(&self.master, wrapped)
     }
 }
 

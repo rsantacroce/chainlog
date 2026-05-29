@@ -1,5 +1,9 @@
 # chainlog
 
+[![CI](https://github.com/your-org/chainlog/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/chainlog/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
+
 A tamper-evident, hash-chained, PII-aware **structured audit log** for Rust.
 
 Use it like a logger — `log.record(...)` — but every entry is sealed into an
@@ -104,8 +108,59 @@ An auditor with only the log file (and no key) can still prove integrity:
 
 ```bash
 chainlog verify ./chainlog.log     # exits non-zero on any violation
-chainlog head   ./chainlog.log     # last seq + hash (use as a signed checkpoint)
+chainlog head   ./chainlog.log     # last seq + hash
 chainlog inspect ./chainlog.log --key "$CHAINLOG_KEY"   # decrypt PII to read
+```
+
+`verify` accepts either a single log file or a segment directory.
+
+## Signed checkpoints
+
+A checkpoint is a small Ed25519-signed statement — "at time T the head was
+`(seq, head_hash)`". Co-signing or publishing checkpoints pins history so even an
+operator with storage access cannot rewrite entries before a checkpoint
+undetectably.
+
+```bash
+chainlog gen-sign-key > sign.json                       # {secret, public}
+CHAINLOG_SIGN_KEY=<secret> chainlog-server              # enables GET /v1/checkpoint
+chainlog checkpoint ./chainlog.log --sign-key <secret>  # offline checkpoint
+chainlog verify ./chainlog.log --checkpoint cp.json     # head must match checkpoint
+```
+
+## Retention without breaking the chain
+
+Rotate into segment files and prune old ones. Pruning returns an **anchor**; pair
+it with a signed checkpoint taken at that boundary and the trimmed log still
+verifies — from the anchor instead of from genesis.
+
+```bash
+# server in segmented mode
+CHAINLOG_DATA=./segs CHAINLOG_SEGMENT_MAX_ENTRIES=100000 chainlog-server
+
+# retention sweep (offline): drop everything older than 365 days
+chainlog prune ./segs --before-days 365     # prints the anchor to keep
+
+# the pruned log verifies against the boundary checkpoint
+chainlog verify ./segs --anchor boundary_checkpoint.json
+```
+
+## PII erasure (crypto-shred)
+
+With a per-subject **keyring**, each subject's PII is sealed under its own key.
+Destroying that key makes the subject's PII permanently unrecoverable (GDPR-style
+erasure) while every hash and signature stays valid.
+
+```bash
+# server in keyring mode
+CHAINLOG_KEYRING_DIR=./keys CHAINLOG_ADMIN_TOKEN=admin chainlog-server
+
+# write with a per-subject key_id, then erase that subject:
+curl -X DELETE localhost:8888/v1/keys/subject-123 -H 'Authorization: Bearer admin'
+# or offline:
+chainlog shred ./keys subject-123
+
+chainlog verify ./chainlog.log    # still intact after the erasure
 ```
 
 ## Architecture
@@ -139,10 +194,20 @@ crypto-shred a single subject's PII on request.
 
 ## Status
 
-`v0.1` — core engine, crypto, file/memory stores, verifier, HTTP server, and CLI
-are implemented and tested. Roadmap: segmented files + rotation, signed
-checkpoints / Merkle anchoring, KMS providers, and an async client crate.
+`v0.1`. Implemented and tested:
+
+- core engine (single-writer chain), BLAKE3 hashing, envelope-encrypted PII
+- file, in-memory, and **segmented/rotating** stores
+- key-free verifier with **anchor** support for pruned logs
+- **Ed25519 signed checkpoints**
+- **retention pruning** that keeps the log verifiable via an anchor
+- **per-subject keyring** with **crypto-shred** (KMS/HSM pluggable via `KeyProvider`)
+- standalone HTTP server and offline CLI
+
+Roadmap: Merkle batch anchoring, first-party KMS adapters (AWS/GCP/Vault), and a
+typed async client crate.
 
 ## License
 
 MIT
+
