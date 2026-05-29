@@ -31,9 +31,9 @@ use axum::{
     Json, Router,
 };
 use chainlog_core::{
-    now_ms, open, read_all, read_all_segmented, verify_entries, AuditEntry, AuditLog,
-    CheckpointSigner, FileStore, KeyProvider, KeyringProvider, LocalKeyProvider, Outcome, Record,
-    SegmentedStore,
+    build_merkle_anchor, merkle_proof_for_seq, merkle_root, now_ms, open, read_all,
+    read_all_segmented, verify_entries, AuditEntry, AuditLog, CheckpointSigner, FileStore,
+    KeyProvider, KeyringProvider, LocalKeyProvider, Outcome, Record, SegmentedStore,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -226,6 +226,53 @@ async fn verify(
     Ok((status, Json(report)))
 }
 
+async fn merkle_anchor(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require(&headers, &st.read_token)?;
+    let signer = st.signer.as_ref().ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "no signing key configured (set CHAINLOG_SIGN_KEY)".into(),
+        )
+    })?;
+    let entries = read_log(&st.data_path, st.segmented)?;
+    Ok(Json(build_merkle_anchor(signer, &entries, now_ms())))
+}
+
+#[derive(Deserialize)]
+struct ProofQuery {
+    seq: u64,
+}
+
+async fn merkle_proof_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ProofQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require(&headers, &st.read_token)?;
+    let entries = read_log(&st.data_path, st.segmented)?;
+    let proof = merkle_proof_for_seq(&entries, q.seq).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no entry with seq {}", q.seq),
+        )
+    })?;
+    let leaf = entries
+        .iter()
+        .find(|e| e.seq == q.seq)
+        .map(|e| e.entry_hash.clone());
+    let leaves: Vec<&str> = entries.iter().map(|e| e.entry_hash.as_str()).collect();
+    let root = merkle_root(&leaves);
+    Ok(Json(json!({
+        "seq": q.seq,
+        "leaf": leaf,
+        "root": root,
+        "proof": proof,
+    })))
+}
+
 fn require_keyring(st: &AppState) -> Result<&Arc<KeyringProvider>, ApiError> {
     st.keyring.as_ref().ok_or_else(|| {
         ApiError(
@@ -394,6 +441,8 @@ async fn main() {
         .route("/v1/records", post(append).get(read_records))
         .route("/v1/head", get(head))
         .route("/v1/checkpoint", get(checkpoint))
+        .route("/v1/merkle-anchor", get(merkle_anchor))
+        .route("/v1/merkle-proof", get(merkle_proof_handler))
         .route("/v1/verify", get(verify))
         .route("/v1/keys", get(list_keys))
         .route("/v1/keys/:key_id", post(create_key).delete(shred_key))

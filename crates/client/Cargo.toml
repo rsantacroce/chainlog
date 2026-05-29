@@ -1,0 +1,23 @@
+[package]
+name = "chainlog-client"
+description = "Typed async HTTP client for a chainlog-server audit log"
+keywords = ["audit-log", "client", "http", "async"]
+categories = ["api-bindings", "cryptography"]
+readme = "README.md"
+documentation = "https://docs.rs/chainlog-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chainlog-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

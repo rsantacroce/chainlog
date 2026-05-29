@@ -169,6 +169,48 @@ remaining tail against the checkpoint at the prune boundary).
 
 ---
 
+## `GET /v1/merkle-anchor`  *(read token)*
+
+Return a single Ed25519-signed Merkle root over all entries — commit to many
+entries with one signature. Requires `CHAINLOG_SIGN_KEY`, else `501`.
+
+```json
+200 OK
+{
+  "from_seq": 1,
+  "to_seq": 5,
+  "count": 5,
+  "root": "d0679278…",
+  "timestamp": 1780000000000,
+  "public_key": "…",
+  "signature": "…"
+}
+```
+
+## `GET /v1/merkle-proof?seq=N`  *(read token)*
+
+Return a compact inclusion proof that entry `N` is committed under the current
+Merkle root. `404` if no such entry.
+
+```json
+200 OK
+{
+  "seq": 3,
+  "leaf": "03c7efe0…",                 // the entry_hash
+  "root": "d0679278…",
+  "proof": {
+    "leaf_index": 2,
+    "leaf_count": 5,
+    "path": [ { "hash": "f9ded6b5…", "right": true }, ... ]
+  }
+}
+```
+
+Verify offline with `chainlog merkle-verify` (optionally against the signed
+anchor). Proof verification needs no key.
+
+---
+
 ## Key management *(admin token)*
 
 Only available when the server runs in keyring mode (`CHAINLOG_KEYRING_DIR`).

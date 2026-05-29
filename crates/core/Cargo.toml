@@ -1,6 +1,10 @@
 [package]
 name = "chainlog-core"
 description = "Tamper-evident, hash-chained, PII-aware structured audit log (embeddable core)"
+keywords = ["audit-log", "tamper-evident", "hash-chain", "compliance", "logging"]
+categories = ["cryptography", "data-structures"]
+readme = "README.md"
+documentation = "https://docs.rs/chainlog-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

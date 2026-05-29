@@ -8,11 +8,23 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use chainlog_core::{
-    now_ms, open, prune_before, prune_before_timestamp, read_all, read_all_segmented,
-    verify_checkpoint, verify_entries_from, Anchor, AuditEntry, Checkpoint, CheckpointSigner,
-    KeyProvider, KeyringProvider, LocalKeyProvider,
+    build_merkle_anchor, merkle_proof_for_seq, merkle_root, now_ms, open, prune_before,
+    prune_before_timestamp, read_all, read_all_segmented, verify_checkpoint, verify_entries_from,
+    verify_merkle_anchor, verify_merkle_proof, Anchor, AuditEntry, Checkpoint, CheckpointSigner,
+    KeyProvider, KeyringProvider, LocalKeyProvider, MerkleAnchor, MerkleProof,
 };
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+
+/// A self-contained Merkle inclusion proof bundle (printed by `merkle-proof`,
+/// consumed by `merkle-verify`).
+#[derive(Serialize, Deserialize)]
+struct ProofBundle {
+    seq: u64,
+    leaf: String,
+    root: String,
+    proof: MerkleProof,
+}
 
 #[derive(Parser)]
 #[command(name = "chainlog", version, about = "Tamper-evident audit log tools")]
@@ -89,6 +101,26 @@ enum Command {
         keyring: PathBuf,
         /// The key_id (e.g. subject id) to destroy.
         key_id: String,
+    },
+    /// Produce a signed Merkle anchor (one signed root over many entries).
+    MerkleAnchor {
+        path: PathBuf,
+        #[arg(long, env = "CHAINLOG_SIGN_KEY")]
+        sign_key: String,
+    },
+    /// Produce an inclusion proof bundle for one entry.
+    MerkleProof {
+        path: PathBuf,
+        #[arg(long)]
+        seq: u64,
+    },
+    /// Verify an inclusion proof bundle; optionally check it against an anchor.
+    MerkleVerify {
+        /// Proof bundle file (output of `merkle-proof`).
+        proof: PathBuf,
+        /// Optional signed anchor file; verifies its signature and that roots match.
+        #[arg(long)]
+        anchor: Option<PathBuf>,
     },
 }
 
@@ -301,6 +333,70 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string(&v)?);
             }
             Ok(ExitCode::SUCCESS)
+        }
+
+        Command::MerkleAnchor { path, sign_key } => {
+            let entries = load_entries(&path)?;
+            let signer = CheckpointSigner::from_base64(&sign_key)?;
+            let anchor = build_merkle_anchor(&signer, &entries, now_ms());
+            println!("{}", serde_json::to_string_pretty(&anchor)?);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::MerkleProof { path, seq } => {
+            let entries = load_entries(&path)?;
+            let proof = match merkle_proof_for_seq(&entries, seq) {
+                Some(p) => p,
+                None => {
+                    eprintln!("no entry with seq {seq}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            let leaf = entries
+                .iter()
+                .find(|e| e.seq == seq)
+                .map(|e| e.entry_hash.clone())
+                .unwrap_or_default();
+            let leaves: Vec<&str> = entries.iter().map(|e| e.entry_hash.as_str()).collect();
+            let bundle = ProofBundle {
+                seq,
+                leaf,
+                root: merkle_root(&leaves),
+                proof,
+            };
+            println!("{}", serde_json::to_string_pretty(&bundle)?);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::MerkleVerify { proof, anchor } => {
+            let bundle: ProofBundle = serde_json::from_str(&std::fs::read_to_string(&proof)?)?;
+            let mut ok = verify_merkle_proof(bundle.leaf.as_bytes(), &bundle.proof, &bundle.root)?;
+            if ok {
+                eprintln!("OK: leaf is included in root {}", bundle.root);
+            } else {
+                eprintln!("FAIL: inclusion proof does not validate");
+            }
+            if let Some(apath) = anchor {
+                let a: MerkleAnchor = serde_json::from_str(&std::fs::read_to_string(&apath)?)?;
+                match verify_merkle_anchor(&a) {
+                    Ok(()) if a.root == bundle.root => {
+                        eprintln!("OK: anchor signature valid and root matches");
+                    }
+                    Ok(()) => {
+                        eprintln!("FAIL: anchor root {} != proof root {}", a.root, bundle.root);
+                        ok = false;
+                    }
+                    Err(e) => {
+                        eprintln!("FAIL: anchor signature invalid: {e}");
+                        ok = false;
+                    }
+                }
+            }
+            Ok(if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
 
         Command::Shred { keyring, key_id } => {

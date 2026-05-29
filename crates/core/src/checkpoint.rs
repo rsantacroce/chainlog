@@ -89,6 +89,30 @@ impl CheckpointSigner {
             signature: B64.encode(sig.to_bytes()),
         }
     }
+
+    /// Low-level: sign an arbitrary message, returning a base64 signature.
+    /// Used by higher-level signed artifacts (e.g. Merkle anchors).
+    pub fn sign_bytes(&self, msg: &[u8]) -> String {
+        let sig: Signature = self.key.sign(msg);
+        B64.encode(sig.to_bytes())
+    }
+}
+
+/// Low-level: verify a base64 signature over `msg` against a base64 public key.
+pub fn verify_signature(public_key_b64: &str, msg: &[u8], signature_b64: &str) -> Result<()> {
+    let pk: [u8; 32] = B64
+        .decode(public_key_b64)?
+        .try_into()
+        .map_err(|_| Error::Crypto("public key must be 32 bytes".into()))?;
+    let vk =
+        VerifyingKey::from_bytes(&pk).map_err(|e| Error::Crypto(format!("bad public key: {e}")))?;
+    let sig_bytes: [u8; 64] = B64
+        .decode(signature_b64)?
+        .try_into()
+        .map_err(|_| Error::Crypto("signature must be 64 bytes".into()))?;
+    let sig = Signature::from_bytes(&sig_bytes);
+    vk.verify(msg, &sig)
+        .map_err(|e| Error::Crypto(format!("signature invalid: {e}")))
 }
 
 /// Verify that a checkpoint's signature is valid for its embedded public key.

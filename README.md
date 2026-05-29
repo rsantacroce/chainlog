@@ -39,7 +39,8 @@ chainlog/
 ├── crates/
 │   ├── core/     chainlog-core  — the embeddable library (engine, crypto, store, verify)
 │   ├── server/   chainlog-server — standalone HTTP service (append-only, isolated)
-│   └── cli/      chainlog        — offline verifier / inspector / keygen
+│   ├── cli/      chainlog        — offline verifier / inspector / keygen
+│   └── client/   chainlog-client — typed async HTTP client (reqwest)
 └── docs/
     └── PROTOCOL.md — HTTP wire protocol
 ```
@@ -162,6 +163,20 @@ chainlog shred ./keys subject-123
 
 chainlog verify ./chainlog.log    # still intact after the erasure
 ```
+
+## Merkle batch anchoring
+
+Commit to *many* entries with one signed root, then prove any single entry is
+included with an `O(log n)` proof — without revealing the others.
+
+```bash
+chainlog merkle-anchor ./chainlog.log --sign-key <secret> > anchor.json
+chainlog merkle-proof  ./chainlog.log --seq 3            > proof.json
+chainlog merkle-verify proof.json --anchor anchor.json   # checks proof + signed root
+```
+
+The tree is RFC 6962-style (domain-separated leaves/nodes, BLAKE3). Proof
+verification needs no key.
 
 ## Architecture
 

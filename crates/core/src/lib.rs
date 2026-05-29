@@ -44,17 +44,24 @@ mod error;
 mod hash;
 mod keyring;
 mod log;
+mod merkle;
 mod segment;
 mod store;
 mod util;
 mod verify;
 
-pub use checkpoint::{verify_checkpoint, verify_checkpoint_with, Checkpoint, CheckpointSigner};
+pub use checkpoint::{
+    verify_checkpoint, verify_checkpoint_with, verify_signature, Checkpoint, CheckpointSigner,
+};
 pub use crypto::{open, seal, KeyProvider, LocalKeyProvider};
 pub use entry::{AuditEntry, EncryptedPii, Outcome, Payload, Receipt, Record, GENESIS_PREV_HASH};
 pub use error::{Error, Result};
 pub use keyring::KeyringProvider;
 pub use log::{AuditLog, Builder};
+pub use merkle::{
+    build_merkle_anchor, merkle_proof, merkle_proof_for_seq, merkle_root, verify_merkle_anchor,
+    verify_merkle_proof, MerkleAnchor, MerkleProof, ProofStep,
+};
 pub use segment::{prune_before, prune_before_timestamp, read_all_segmented, SegmentedStore};
 pub use store::{read_all, FileStore, MemoryStore, Store};
 pub use util::now_ms;
@@ -394,6 +401,60 @@ mod tests {
     }
 
     use std::sync::Arc;
+
+    #[test]
+    fn merkle_proofs_validate_for_every_leaf() {
+        // Try several sizes, including non-powers-of-two.
+        for n in [1usize, 2, 3, 5, 8, 13] {
+            let leaves: Vec<String> = (0..n).map(|i| format!("leaf-{i}")).collect();
+            let root = merkle_root(&leaves);
+            for (i, leaf) in leaves.iter().enumerate() {
+                let proof = merkle_proof(&leaves, i).unwrap();
+                assert!(
+                    verify_merkle_proof(leaf.as_bytes(), &proof, &root).unwrap(),
+                    "proof failed for n={n} i={i}"
+                );
+                // A wrong leaf must not verify.
+                assert!(!verify_merkle_proof(b"not-a-leaf", &proof, &root).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn signed_merkle_anchor_over_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::builder()
+            .store(FileStore::open(&path).unwrap())
+            .key_provider(LocalKeyProvider::generate().unwrap())
+            .build()
+            .unwrap();
+        for i in 0..6 {
+            log.record(Record::new("evt", Outcome::Success, "a").data(json!({ "i": i })))
+                .unwrap();
+        }
+        drop(log);
+        let entries = read_all(&path).unwrap();
+
+        let signer = CheckpointSigner::generate().unwrap();
+        let anchor = build_merkle_anchor(&signer, &entries, 1780000000000);
+        assert!(verify_merkle_anchor(&anchor).is_ok());
+
+        // Prove entry seq=3 is in the anchored root.
+        let proof = merkle_proof_for_seq(&entries, 3).unwrap();
+        let leaf = entries
+            .iter()
+            .find(|e| e.seq == 3)
+            .unwrap()
+            .entry_hash
+            .clone();
+        assert!(verify_merkle_proof(leaf.as_bytes(), &proof, &anchor.root).unwrap());
+
+        // A tampered anchor signature is rejected.
+        let mut forged = anchor.clone();
+        forged.root = merkle_root(&["different"]);
+        assert!(verify_merkle_anchor(&forged).is_err());
+    }
 
     #[test]
     fn chain_resumes_across_reopen() {

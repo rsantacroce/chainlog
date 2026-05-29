@@ -1,6 +1,9 @@
 [package]
 name = "chainlog-server"
 description = "Standalone HTTP service wrapping chainlog-core — append-only, isolated audit log"
+keywords = ["audit-log", "tamper-evident", "compliance", "server"]
+categories = ["cryptography", "web-programming::http-server"]
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
